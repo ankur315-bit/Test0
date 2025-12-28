@@ -44,6 +44,36 @@
     const COLLEGE_LNG = 81.6300;
     const ALLOWED_RADIUS = 15; // 15 Meters
 
+    // State Persistence for Real-Time Attendance Verification
+    // This object tracks verified data as the student progresses through the 4 verification steps
+    let verificationData = {
+        sessionId: null,           // Active attendance session ID
+        step: 0,                   // Current step (1: WiFi, 2: Location, 3: Face, 4: Submit)
+        wifi: {
+            verified: false,
+            ipAddress: null,       // Real IP from API response
+            ssid: null,
+            macAddress: null,
+            deviceInfo: null,
+            verifiedAt: null
+        },
+        location: {
+            verified: false,
+            latitude: null,        // Real coords from geofence check
+            longitude: null,
+            accuracy: null,
+            distanceFromClass: null,
+            verifiedAt: null
+        },
+        face: {
+            verified: false,
+            confidence: null,      // Confidence score from face verification API
+            capturedImage: null,
+            verifiedAt: null
+        },
+        subject: null              // Subject name for which attendance is being marked
+    };
+
     // Data storage
     let fullTimetable = {};
     let weeklySchedule = {};
@@ -1284,6 +1314,17 @@
     window.initAtt = function (sub, btn) {
         currentButton = btn;
         document.getElementById('modalSubject').innerText = sub;
+        
+        // Reset verification state for new attendance marking
+        verificationData = {
+            sessionId: null,
+            step: 0,
+            wifi: { verified: false, ipAddress: null, ssid: null, macAddress: null, deviceInfo: null, verifiedAt: null },
+            location: { verified: false, latitude: null, longitude: null, accuracy: null, distanceFromClass: null, verifiedAt: null },
+            face: { verified: false, confidence: null, capturedImage: null, verifiedAt: null },
+            subject: sub
+        };
+        
         document.getElementById('cameraContainer').style.display = 'none';
         document.getElementById('locationStep').style.display = 'block';
         document.getElementById('errorMsg').classList.add('d-none');
@@ -1291,28 +1332,133 @@
         document.getElementById('photo').style.display = 'none';
         document.getElementById('videoElement').style.display = 'block';
         modalObj.show();
-        verifyLoc();
+        
+        // Start with WiFi verification
+        checkWiFiConnection();
     };
 
-    function verifyLoc() {
+    // Step 1: WiFi Connection Verification
+    async function checkWiFiConnection() {
         const spin = document.getElementById('locSpinner');
         const txt = document.getElementById('locStatusText');
-        if (!navigator.geolocation) { showError("GPS Missing"); return; }
-
-        navigator.geolocation.getCurrentPosition(pos => {
-            const dist = getDist(pos.coords.latitude, pos.coords.longitude, COLLEGE_LAT, COLLEGE_LNG);
-            document.getElementById('distanceDisplay').innerText = `Dist: ${Math.round(dist)}m`;
-
-            if (dist <= ALLOWED_RADIUS) {
-                spin.className = "bi bi-check-circle-fill text-success fs-5";
-                txt.className = "text-success fw-bold"; txt.innerText = "Location Verified!";
-                setTimeout(startCam, 1000);
+        
+        try {
+            // Show loading state
+            spin.className = "bi bi-wifi2 text-info fs-5 spin-animation";
+            txt.className = "text-info fw-bold";
+            txt.innerText = "Checking WiFi connection...";
+            
+            // Check for active attendance session with WiFi hotspot
+            const response = await apiRequest('/attendance/active-session');
+            
+            if (response.success && response.hasActiveSession) {
+                const session = response.session;
+                verificationData.sessionId = session._id;
+                
+                // Call WiFi detection API
+                const wifiResponse = await apiRequest('/wifi/detect', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        ssid: session.wifiConfig.ssid
+                    })
+                });
+                
+                if (wifiResponse.success && wifiResponse.wifi) {
+                    // Store actual WiFi data from API response
+                    verificationData.wifi.verified = true;
+                    verificationData.wifi.ipAddress = wifiResponse.wifi.ipAddress;    // Real IP from API
+                    verificationData.wifi.ssid = wifiResponse.wifi.ssid;
+                    verificationData.wifi.macAddress = wifiResponse.wifi.macAddress;
+                    verificationData.wifi.deviceInfo = wifiResponse.wifi.deviceInfo;
+                    verificationData.wifi.verifiedAt = new Date();
+                    verificationData.step = 1;
+                    
+                    // Update UI to show success
+                    spin.className = "bi bi-check-circle-fill text-success fs-5";
+                    txt.className = "text-success fw-bold";
+                    txt.innerText = "WiFi Verified!";
+                    
+                    // Move to location verification
+                    setTimeout(verifyStudentLocation, 1000);
+                } else {
+                    showError(wifiResponse.message || "Could not connect to class WiFi");
+                }
             } else {
-                spin.className = "bi bi-x-circle-fill text-danger fs-5";
-                txt.className = "text-danger fw-bold"; txt.innerText = "Outside Geofence";
-                showError(`Too far (${Math.round(dist)}m). Move inside campus.`);
+                showError("No active attendance session. Please wait for your instructor to start the session.");
             }
-        }, () => showError("GPS Denied"));
+        } catch (error) {
+            console.error('WiFi verification error:', error);
+            showError(error.message || "WiFi verification failed. Please try again.");
+        }
+    }
+
+    // Step 2: Location Verification
+    function verifyStudentLocation() {
+        const spin = document.getElementById('locSpinner');
+        const txt = document.getElementById('locStatusText');
+        
+        if (!navigator.geolocation) { 
+            showError("GPS Missing"); 
+            return; 
+        }
+
+        // Show loading state
+        spin.className = "bi bi-geo text-info fs-5 spin-animation";
+        txt.className = "text-info fw-bold";
+        txt.innerText = "Verifying location...";
+
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+            try {
+                // Send location to server for geofence validation
+                const geoResponse = await apiRequest('/attendance/verify-location', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        sessionId: verificationData.sessionId,
+                        latitude: pos.coords.latitude,
+                        longitude: pos.coords.longitude,
+                        accuracy: pos.coords.accuracy
+                    })
+                });
+                
+                const dist = getDist(
+                    pos.coords.latitude, 
+                    pos.coords.longitude, 
+                    COLLEGE_LAT, 
+                    COLLEGE_LNG
+                );
+                document.getElementById('distanceDisplay').innerText = `Dist: ${Math.round(dist)}m`;
+
+                if (geoResponse.success) {
+                    // Store actual location data from geofence verification
+                    verificationData.location.verified = true;
+                    verificationData.location.latitude = pos.coords.latitude;   // Real latitude from geofence check
+                    verificationData.location.longitude = pos.coords.longitude; // Real longitude from geofence check
+                    verificationData.location.accuracy = pos.coords.accuracy;
+                    verificationData.location.distanceFromClass = dist;
+                    verificationData.location.verifiedAt = new Date();
+                    verificationData.step = 2;
+                    
+                    spin.className = "bi bi-check-circle-fill text-success fs-5";
+                    txt.className = "text-success fw-bold";
+                    txt.innerText = "Location Verified!";
+                    
+                    setTimeout(startCam, 1000);
+                } else {
+                    spin.className = "bi bi-x-circle-fill text-danger fs-5";
+                    txt.className = "text-danger fw-bold";
+                    txt.innerText = "Outside Geofence";
+                    showError(
+                        geoResponse.error || 
+                        `Too far (${Math.round(dist)}m). Move inside campus.`
+                    );
+                }
+            } catch (error) {
+                console.error('Location verification error:', error);
+                showError(error.message || "Location verification failed");
+            }
+        }, () => {
+            showError("GPS access denied. Please enable location permissions.");
+        });
     }
 
     function getDist(lat1, lon1, lat2, lon2) {
@@ -1325,61 +1471,211 @@
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
+    // Step 3: Face Capture and Verification
     async function startCam() {
         document.getElementById('locationStep').style.display = 'none';
         document.getElementById('cameraContainer').style.display = 'block';
         try {
             videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
             document.getElementById('videoElement').srcObject = videoStream;
+            document.getElementById('submitBtn').disabled = false; // Enable capture button
         }
-        catch { showError("Cam Access Denied"); }
+        catch { showError("Camera access denied. Please enable camera permissions."); }
     }
 
-    window.takeSnapshot = function () {
+    window.takeSnapshot = async function () {
         const v = document.getElementById('videoElement');
         const c = document.getElementById('canvas');
+        if (!c) {
+            showError("Canvas element not found");
+            return;
+        }
+        
         c.width = v.videoWidth;
         c.height = v.videoHeight;
         c.getContext('2d').drawImage(v, 0, 0);
-        document.getElementById('photo').src = c.toDataURL('image/png');
+        
+        // Get captured image
+        const capturedImage = c.toDataURL('image/png');
+        const photoEl = document.getElementById('photo');
+        if (photoEl) photoEl.src = capturedImage;
         v.style.display = 'none';
-        document.getElementById('photo').style.display = 'block';
-        document.getElementById('submitBtn').disabled = false;
+        if (photoEl) photoEl.style.display = 'block';
+        
+        // Disable submit button temporarily during verification
+        const submitBtn = document.getElementById('submitBtn');
+        if (!submitBtn) {
+            showError("Submit button not found");
+            return;
+        }
+        
+        submitBtn.disabled = true;
+        const originalText = submitBtn.innerHTML;
+        submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Verifying face...';
+        
+        try {
+            // Send face image to server for verification
+            const faceResponse = await apiRequest('/face/verify', {
+                method: 'POST',
+                body: JSON.stringify({
+                    sessionId: verificationData.sessionId,
+                    capturedImage: capturedImage
+                })
+            });
+            
+            if (faceResponse.success && faceResponse.verified) {
+                // Store face verification data
+                verificationData.face.verified = true;
+                verificationData.face.confidence = faceResponse.confidence;  // Real confidence score from API
+                verificationData.face.capturedImage = capturedImage;
+                verificationData.face.verifiedAt = new Date();
+                verificationData.step = 3;
+                
+                showToast(`Face verified! Confidence: ${Math.round(faceResponse.confidence * 100)}%`, 'success');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="bi bi-cloud-upload me-2"></i>Submit Attendance';
+            } else {
+                showError(faceResponse.message || "Face verification failed. Please try again.");
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = originalText;
+            }
+        } catch (error) {
+            console.error('Face verification error:', error);
+            showError(error.message || "Face verification failed");
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalText;
+        }
     };
 
-    window.finalizeAttendance = function () {
-        const r = currentButton.closest('tr');
-        r.querySelector('.badge-status').className = "badge bg-success rounded-pill badge-status";
-        r.querySelector('.badge-status').innerText = "Present";
-        r.querySelector('.loc-info').innerHTML = `<i class="bi bi-geo-fill text-success"></i> Verified`;
-        currentButton.className = "btn btn-success btn-sm rounded-pill px-3";
-        currentButton.innerHTML = '<i class="bi bi-check2"></i> Marked';
-        currentButton.disabled = true;
+    // Step 4: Submit Attendance with Verified Data
+    window.finalizeAttendance = async function () {
+        // Validate all verification steps completed
+        if (!verificationData.wifi.verified) {
+            showError("WiFi verification not completed");
+            return;
+        }
+        if (!verificationData.location.verified) {
+            showError("Location verification not completed");
+            return;
+        }
+        if (!verificationData.face.verified) {
+            showError("Face verification not completed");
+            return;
+        }
+        if (!verificationData.sessionId) {
+            showError("No active attendance session");
+            return;
+        }
+        
+        const submitBtn = document.getElementById('submitBtn');
+        const originalHTML = submitBtn.innerHTML;
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Submitting...';
+        
+        try {
+            // Submit to API with REAL verified data (not hardcoded)
+            const response = await apiRequest('/attendance/verify', {
+                method: 'POST',
+                body: JSON.stringify({
+                    sessionId: verificationData.sessionId,
+                    wifiData: {
+                        ipAddress: verificationData.wifi.ipAddress,      // Real IP from Step 1
+                        ssid: verificationData.wifi.ssid,
+                        macAddress: verificationData.wifi.macAddress,
+                        deviceInfo: verificationData.wifi.deviceInfo
+                    },
+                    locationData: {
+                        latitude: verificationData.location.latitude,    // Real coords from Step 2
+                        longitude: verificationData.location.longitude,
+                        accuracy: verificationData.location.accuracy
+                    },
+                    faceData: {
+                        capturedImage: verificationData.face.capturedImage,
+                        confidence: verificationData.face.confidence      // Real confidence from Step 3
+                    }
+                })
+            });
+            
+            if (response.success) {
+                verificationData.step = 4;
+                
+                // Update UI to show success
+                const r = currentButton.closest('tr');
+                if (r) {
+                    r.querySelector('.badge-status').className = "badge bg-success rounded-pill badge-status";
+                    r.querySelector('.badge-status').innerText = response.status.toUpperCase();
+                    r.querySelector('.loc-info').innerHTML = `<i class="bi bi-geo-fill text-success"></i> Verified`;
+                    currentButton.className = "btn btn-success btn-sm rounded-pill px-3";
+                    currentButton.innerHTML = '<i class="bi bi-check2"></i> Marked';
+                    currentButton.disabled = true;
+                }
 
-        const subj = document.getElementById('modalSubject').innerText || 'Subject';
-        const now = new Date();
-        const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        activityLog.unshift({ t: timeStr, msg: `Marked Present in ${subj}` });
-        if (activityLog.length > 10) activityLog.pop();
-        attendanceHistory.unshift({ date: now.toISOString().slice(0, 10), subject: subj, status: 'Present' });
-        if (attendanceHistory.length > 50) attendanceHistory.pop();
-        updateActivityFeed();
-        addNotification(`${subj} marked present at ${timeStr}`);
+                // Update activity log and notifications
+                const subj = verificationData.subject || 'Subject';
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                activityLog.unshift({ 
+                    t: timeStr, 
+                    msg: `Marked ${response.status.toUpperCase()} in ${subj}` 
+                });
+                if (activityLog.length > 10) activityLog.pop();
+                
+                attendanceHistory.unshift({ 
+                    date: now.toISOString().slice(0, 10), 
+                    subject: subj, 
+                    status: response.status 
+                });
+                if (attendanceHistory.length > 50) attendanceHistory.pop();
+                
+                updateActivityFeed();
+                addNotification(`${subj} marked ${response.status.toUpperCase()} at ${timeStr}`);
 
-        // Reload attendance data from server to get updated stats
-        loadAttendanceData().then(() => {
-            loadDashboardSchedule(); // Refresh schedule with new status
-        });
+                // Reload attendance data from server to get updated stats
+                loadAttendanceData().then(() => {
+                    loadDashboardSchedule(); // Refresh schedule with new status
+                });
 
-        // show animated success feedback, vibrate on supported devices
-        showSuccessMessage('Marked Present', () => {
-            populateAttendanceHistory();
-            closeCamera();
-        });
+                // Show animated success feedback
+                showSuccessMessage(`Attendance Marked as ${response.status.toUpperCase()}`, () => {
+                    populateAttendanceHistory();
+                    closeCamera();
+                });
+                
+                // Log verification details for audit
+                console.log('Attendance submitted with verification data:', {
+                    sessionId: verificationData.sessionId,
+                    wifiIP: verificationData.wifi.ipAddress,
+                    coords: {
+                        lat: verificationData.location.latitude,
+                        lon: verificationData.location.longitude
+                    },
+                    faceConfidence: verificationData.face.confidence
+                });
+            } else {
+                showError(response.message || "Failed to submit attendance");
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = originalHTML;
+            }
+        } catch (error) {
+            console.error('Attendance submission error:', error);
+            showError(error.message || "Failed to submit attendance. Please try again.");
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalHTML;
+        }
     };
 
     window.closeCamera = function () {
         if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+        // Reset verification state for next attendance
+        verificationData = {
+            sessionId: null,
+            step: 0,
+            wifi: { verified: false, ipAddress: null, ssid: null, macAddress: null, deviceInfo: null, verifiedAt: null },
+            location: { verified: false, latitude: null, longitude: null, accuracy: null, distanceFromClass: null, verifiedAt: null },
+            face: { verified: false, confidence: null, capturedImage: null, verifiedAt: null },
+            subject: null
+        };
         modalObj.hide();
     };
 
@@ -1387,6 +1683,7 @@
         const e = document.getElementById('errorMsg');
         e.innerText = m;
         e.classList.remove('d-none');
+        console.error('Attendance Error:', m);
     }
 
     // Generic chart creator
@@ -2212,5 +2509,26 @@
     if (studentNameEl && user.name) {
         studentNameEl.textContent = `Welcome, ${user.name.toUpperCase()}`;
     }
+
+    // Add CSS animation for spinning loading indicator
+    if (!document.getElementById('spin-animation-style')) {
+        const style = document.createElement('style');
+        style.id = 'spin-animation-style';
+        style.textContent = `
+            .spin-animation {
+                animation: spin 1s linear infinite;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // Log verification data state for debugging
+    window.getVerificationState = function () {
+        return verificationData;
+    };
 
 })();
